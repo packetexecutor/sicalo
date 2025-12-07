@@ -1,0 +1,47 @@
+name: Windows RDP (Singapore)
+on:
+  workflow_dispatch:
+    inputs:
+      password:
+        required: true
+      ngrok_token:
+        required: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Config System
+      run: |
+        netsh int tcp set global congestionprovider=ctcp
+        choco install googlechrome 7zip -y --no-progress
+
+    - name: Set Password
+      run: net user runneradmin "${{ inputs.password }}"
+
+    - name: Tunnel (Ngrok Asia)
+      run: |
+        Invoke-WebRequest https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip -OutFile ngrok.zip
+        Expand-Archive ngrok.zip -DestinationPath . -Force
+        .\ngrok.exe config add-authtoken "${{ inputs.ngrok_token }}"
+        Start-Process .\ngrok.exe -ArgumentList "tcp --region ap 3389" -WindowStyle Hidden
+        Start-Sleep -Seconds 10
+
+    - name: Export Info
+      shell: pwsh
+      run: |
+        try {
+          $url = (Invoke-RestMethod -Uri http://localhost:4040/api/tunnels).tunnels[0].public_url.Replace("tcp://", "").Trim()
+        } catch {
+          $url = "Error"
+        }
+        echo "$url|${{ inputs.password }}" > info.txt
+
+    - uses: actions/upload-artifact@v4
+      with: {name: result, path: info.txt}
+
+    - run: start-sleep 21600
