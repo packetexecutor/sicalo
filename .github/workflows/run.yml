@@ -1,47 +1,65 @@
-name: Windows RDP (Singapore)
+name: Linux NoVNC (Enhanced)
 on:
   workflow_dispatch:
     inputs:
       password:
         required: true
-      ngrok_token:
+      duration:
         required: true
+        default: "360"
 
 jobs:
   build:
-    runs-on: windows-latest
-    timeout-minutes: 360
-
+    runs-on: self-hosted
+    timeout-minutes: ${{ inputs.duration }}
+    
     steps:
     - uses: actions/checkout@v4
-
-    - name: Config System
+    
+    - name: 📦 Install Desktop Environment
       run: |
-        netsh int tcp set global congestionprovider=ctcp
-        choco install googlechrome 7zip -y --no-progress
-
-    - name: Set Password
-      run: net user runneradmin "${{ inputs.password }}"
-
-    - name: Tunnel (Ngrok Asia)
+        sudo apt update
+        sudo apt install -y xfce4 xfce4-goodies tigervnc-standalone-server python3-websockify curl
+        git clone https://github.com/novnc/noVNC.git
+    
+    - name: 🚀 Start VNC + noVNC
       run: |
-        Invoke-WebRequest https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip -OutFile ngrok.zip
-        Expand-Archive ngrok.zip -DestinationPath . -Force
-        .\ngrok.exe config add-authtoken "${{ inputs.ngrok_token }}"
-        Start-Process .\ngrok.exe -ArgumentList "tcp --region ap 3389" -WindowStyle Hidden
-        Start-Sleep -Seconds 10
-
-    - name: Export Info
-      shell: pwsh
+        mkdir -p ~/.vnc
+        echo "${{ inputs.password }}" | vncpasswd -f > ~/.vnc/passwd
+        chmod 600 ~/.vnc/passwd
+        vncserver :1 -geometry 1920x1080 -depth 24
+        ./noVNC/utils/novnc_proxy --vnc localhost:5901 --listen 6080 &
+        sleep 5
+        
+    - name: 🌐 Setup Cloudflared
       run: |
-        try {
-          $url = (Invoke-RestMethod -Uri http://localhost:4040/api/tunnels).tunnels[0].public_url.Replace("tcp://", "").Trim()
-        } catch {
-          $url = "Error"
-        }
-        echo "$url|${{ inputs.password }}" > info.txt
+        curl -L --output cloudflared-linux-amd64.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+        sudo dpkg -i cloudflared-linux-amd64.deb
+        cloudflared tunnel --url http://localhost:6080 > tunnel.log 2>&1 &
+        sleep 15
+
+    - name: 📤 Export Info
+      run: |
+        URL=$(grep -o 'https://.*.trycloudflare.com' tunnel.log | head -n 1)
+        if [ -z "$URL" ]; then
+          echo "ERROR|Failed to get Cloudflared URL" > info.txt
+        else
+          echo "$URL/vnc.html|${{ inputs.password }}" > info.txt
+        fi
 
     - uses: actions/upload-artifact@v4
-      with: {name: result, path: info.txt}
+      with:
+        name: result
+        path: info.txt
 
-    - run: start-sleep 21600
+    - name: ⏳ Keep Alive + Auto Restart
+      run: |
+        total=${{ inputs.duration }}
+        for ((i=1; i<=total; i++)); do
+          date +"🟢 VPS running - minute %M (%H:%M:%S)"
+          pgrep cloudflared >/dev/null || {
+            echo "⚠️ Cloudflared died, restarting..."
+            cloudflared tunnel --url http://localhost:6080 > tunnel.log 2>&1 &
+          }
+          sleep 60
+        done
