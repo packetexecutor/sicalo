@@ -11,7 +11,7 @@ on:
 jobs:
   build:
     runs-on: self-hosted
-    timeout-minutes: ${{ inputs.duration }}
+    timeout-minutes: 380   # timeout cố định, duration dùng cho keep-alive
     
     steps:
     - uses: actions/checkout@v4
@@ -56,10 +56,10 @@ jobs:
       run: |
         total=${{ inputs.duration }}
         for ((i=1; i<=total; i++)); do
-          date +"🟢 VPS running - minute %M (%H:%M:%S)"
-          pgrep cloudflared >/dev/null || {
+          echo "🟢 VPS running - minute $i/$total ($(date +'%H:%M:%S'))"
+          if ! pgrep cloudflared >/dev/null; then
             echo "⚠️ Cloudflared died, restarting..."
             cloudflared tunnel --url http://localhost:6080 > tunnel.log 2>&1 &
-          }
+          fi
           sleep 60
         done
