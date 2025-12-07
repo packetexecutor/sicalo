@@ -1,65 +1,189 @@
-name: Linux NoVNC (Enhanced)
+name: Windows NoVNC (Self Hosted)
+
 on:
   workflow_dispatch:
     inputs:
       password:
+        description: "Mật khẩu VNC"
         required: true
       duration:
+        description: "Thời gian chạy (phút)"
         required: true
         default: "360"
 
 jobs:
   build:
-    runs-on: self-hosted
+    runs-on: [self-hosted, windows]
     timeout-minutes: 380   # timeout cố định, duration dùng cho keep-alive
-    
+
     steps:
-    - uses: actions/checkout@v4
-    
-    - name: 📦 Install Desktop Environment
+    - name: 🔧 Chuẩn bị thư mục
       run: |
-        sudo apt update
-        sudo apt install -y xfce4 xfce4-goodies tigervnc-standalone-server python3-websockify curl
-        git clone https://github.com/novnc/noVNC.git
-    
-    - name: 🚀 Start VNC + noVNC
-      run: |
-        mkdir -p ~/.vnc
-        echo "${{ inputs.password }}" | vncpasswd -f > ~/.vnc/passwd
-        chmod 600 ~/.vnc/passwd
-        vncserver :1 -geometry 1920x1080 -depth 24
-        ./noVNC/utils/novnc_proxy --vnc localhost:5901 --listen 6080 &
-        sleep 5
-        
-    - name: 🌐 Setup Cloudflared
-      run: |
-        curl -L --output cloudflared-linux-amd64.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-        sudo dpkg -i cloudflared-linux-amd64.deb
-        cloudflared tunnel --url http://localhost:6080 > tunnel.log 2>&1 &
-        sleep 15
+        if (Test-Path info.txt) { Remove-Item info.txt -Force }
 
-    - name: 📤 Export Info
+    - name: 🖥️ Setup TightVNC + noVNC + Cloudflared + KeepAlive
+      shell: pwsh
       run: |
-        URL=$(grep -o 'https://.*.trycloudflare.com' tunnel.log | head -n 1)
-        if [ -z "$URL" ]; then
-          echo "ERROR|Failed to get Cloudflared URL" > info.txt
-        else
-          echo "$URL/vnc.html|${{ inputs.password }}" > info.txt
-        fi
+        $ErrorActionPreference = "Stop"
+        $durationMinutes = [int]"${{ inputs.duration }}"
 
-    - uses: actions/upload-artifact@v4
+        Write-Host "📥 Installing TightVNC, noVNC, and Cloudflared..."
+
+        Write-Host "📥 Installing TightVNC..."
+        Invoke-WebRequest -Uri "https://www.tightvnc.com/download/2.8.63/tightvnc-setup-64bit.msi" -OutFile "tightvnc-setup.msi" -TimeoutSec 60
+        Write-Host "✅ TightVNC downloaded"
+
+        $pw = "${{ inputs.password }}"
+        $args = @(
+          '/i','tightvnc-setup.msi','/quiet','/norestart',
+          'ADDLOCAL=Server','SERVER_REGISTER_AS_SERVICE=1','SERVER_ADD_FIREWALL_EXCEPTION=1',
+          'SET_USEVNCAUTHENTICATION=1','VALUE_OF_USEVNCAUTHENTICATION=1','SET_PASSWORD=1',
+          "VALUE_OF_PASSWORD=$pw",
+          'SET_VIEWONLYPASSWORD=1',"VALUE_OF_VIEWONLYPASSWORD=$pw",
+          'SET_ACCEPTHTTPCONNECTIONS=1','VALUE_OF_ACCEPTHTTPCONNECTIONS=1',
+          'SET_ALLOWLOOPBACK=1','VALUE_OF_ALLOWLOOPBACK=1'
+        )
+        Start-Process msiexec.exe -Wait -ArgumentList $args
+        Write-Host "✅ TightVNC installed"
+
+        Write-Host "🔧 Configuring TightVNC..."
+        New-Item -Path "HKLM:\SOFTWARE\TightVNC" -Name "Server" -Force | Out-Null
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\TightVNC\Server" -Name "AllowLoopback" -Value 1 -Type DWord -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\TightVNC\Server" -Name "AlwaysShared" -Value 1 -Type DWord -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\TightVNC\Server" -Name "NeverShared" -Value 0 -Type DWord -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\TightVNC\Server" -Name "DisconnectAction" -Value 2 -Type DWord -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\TightVNC\Server" -Name "QueryIfNoLogon" -Value 0 -Type DWord -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\TightVNC\Server" -Name "QueryAcceptOnTimeout" -Value 1 -Type DWord -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\TightVNC\Server" -Name "QueryTimeout" -Value 10 -Type DWord -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\TightVNC\Server" -Name "RemoveWallpaper" -Value 0 -Type DWord -ErrorAction SilentlyContinue
+        Write-Host "✅ TightVNC configured"
+
+        Write-Host "🔄 Restarting TightVNC service..."
+        Stop-Service -Name "tvnserver" -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 3
+        Start-Service -Name "tvnserver" -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 10
+        Write-Host "✅ TightVNC service running"
+
+        Write-Host "🔓 Opening firewall ports..."
+        netsh advfirewall firewall add rule name="Allow VNC 5900" dir=in action=allow protocol=TCP localport=5900 | Out-Null
+        netsh advfirewall firewall add rule name="Allow noVNC 6080" dir=in action=allow protocol=TCP localport=6080 | Out-Null
+        Write-Host "✅ Firewall rules added"
+
+        Write-Host "📥 Installing Python dependencies..."
+        try {
+          python -m pip install --upgrade pip --timeout 60
+          pip install --force-reinstall numpy novnc websockify==0.13.0 --timeout 60
+        } catch {
+          Write-Host "⚠️ Python/pip không có sẵn hoặc cài dependency lỗi: $_"
+        }
+
+        Write-Host "📥 Downloading noVNC..."
+        $novncVersion = "v1.6.0"
+        Remove-Item -Recurse -Force noVNC -ErrorAction SilentlyContinue
+        $novncUrl = "https://github.com/novnc/noVNC/archive/refs/tags/$novncVersion.zip"
+        Invoke-WebRequest -Uri $novncUrl -OutFile "noVNC.zip" -TimeoutSec 60
+        Expand-Archive -Path "noVNC.zip" -DestinationPath "." -Force
+        Move-Item -Path "noVNC-$($novncVersion.Substring(1))" -Destination "noVNC" -Force
+        Write-Host "✅ noVNC downloaded and extracted"
+
+        Write-Host "🚀 Starting websockify..."
+        $websockify = $null
+        try {
+          $websockify = Start-Process -FilePath "python" -ArgumentList "-m","websockify","6080","127.0.0.1:5900","--web","noVNC","--verbose" -RedirectStandardOutput "websockify.log" -RedirectStandardError "websockify_error.log" -NoNewWindow -PassThru
+        } catch {
+          Write-Host "⚠️ Không chạy được websockify: $_"
+        }
+        Start-Sleep -Seconds 10
+
+        Write-Host "📥 Downloading Cloudflared..."
+        Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile "cloudflared.exe" -TimeoutSec 60
+        Write-Host "✅ Cloudflared downloaded"
+
+        function Start-Cloudflared {
+          Write-Host "🌐 Starting Cloudflared tunnel..."
+          Start-Process -FilePath "cloudflared.exe" -ArgumentList "tunnel","--url","http://localhost:6080","--no-autoupdate","--edge-ip-version","auto","--protocol","http2","--logfile","cloudflared.log" -WindowStyle Hidden
+        }
+
+        Start-Cloudflared
+        Start-Sleep -Seconds 15
+
+        Write-Host "🚀 Retrieving Cloudflared URL..."
+        $maxAttempts = 120
+        $attempt = 0
+        $cloudflaredUrl = ""
+
+        do {
+          $attempt++
+          Start-Sleep -Seconds 3
+
+          if (Test-Path "cloudflared.log") {
+            try {
+              $logContent = Get-Content "cloudflared.log" -Raw -ErrorAction SilentlyContinue
+              if ($logContent -match 'https://[a-zA-Z0-9-]+\.trycloudflare\.com') {
+                $cloudflaredUrl = $matches[0]
+                Write-Host "✅ Found Cloudflared URL: $cloudflaredUrl"
+                break
+              }
+            } catch {
+              Write-Host "⚠️ Error reading cloudflared.log: $_"
+            }
+          }
+
+          if (-not (Get-Process -Name "cloudflared" -ErrorAction SilentlyContinue)) {
+            Write-Host "⚠️ Cloudflared process not found while getting URL, restarting..."
+            Start-Cloudflared
+            Start-Sleep -Seconds 10
+          }
+        } while ($attempt -lt $maxAttempts)
+
+        if ($cloudflaredUrl) {
+          "$cloudflaredUrl/vnc.html|${{ inputs.password }}" | Out-File -FilePath "info.txt" -Encoding UTF8 -NoNewline
+          Write-Host "✅ Remote VNC URL saved to info.txt"
+        } else {
+          "ERROR|Failed to retrieve Cloudflared URL" | Out-File -FilePath "info.txt" -Encoding UTF8 -NoNewline
+          Write-Host "❌ Failed to get Cloudflared URL"
+        }
+
+        $ErrorActionPreference = "Continue"
+        Write-Host "⏳ Entering keep-alive loop for $durationMinutes minutes..."
+        for ($i = 1; $i -le $durationMinutes; $i++) {
+          $currentTime = Get-Date -Format 'HH:mm:ss'
+          Write-Host "🟢 VPS Running - Minute $i/$durationMinutes ($currentTime)"
+
+          try {
+            if (-not (Get-Process -Name "cloudflared" -ErrorAction SilentlyContinue)) {
+              Write-Host "⚠️ Cloudflared died during keep-alive, restarting..."
+              Start-Cloudflared
+            }
+          } catch {
+            Write-Host "⚠️ Error while checking/restarting Cloudflared: $_"
+          }
+
+          try {
+            Invoke-WebRequest -Uri "http://localhost:6080" -UseBasicParsing -TimeoutSec 5 | Out-Null
+          } catch {
+            Write-Host "⚠️ noVNC/websockify not responding, trying to restart..."
+            try {
+              if ($websockify -and (Get-Process -Id $websockify.Id -ErrorAction SilentlyContinue)) {
+                Stop-Process -Id $websockify.Id -Force -ErrorAction SilentlyContinue
+              }
+            } catch {}
+            try {
+              $websockify = Start-Process -FilePath "python" -ArgumentList "-m","websockify","6080","127.0.0.1:5900","--web","noVNC","--verbose" -RedirectStandardOutput "websockify.log" -RedirectStandardError "websockify_error.log" -NoNewWindow -PassThru
+            } catch {
+              Write-Host "⚠️ Không restart được websockify: $_"
+            }
+          }
+
+          Start-Sleep -Seconds 60
+        }
+
+        Write-Host "⏰ VPS session time limit reached - exiting job."
+
+    - name: 📤 Upload info.txt
+      if: always()
+      uses: actions/upload-artifact@v4
       with:
         name: result
         path: info.txt
-
-    - name: ⏳ Keep Alive + Auto Restart
-      run: |
-        total=${{ inputs.duration }}
-        for ((i=1; i<=total; i++)); do
-          echo "🟢 VPS running - minute $i/$total ($(date +'%H:%M:%S'))"
-          if ! pgrep cloudflared >/dev/null; then
-            echo "⚠️ Cloudflared died, restarting..."
-            cloudflared tunnel --url http://localhost:6080 > tunnel.log 2>&1 &
-          fi
-          sleep 60
-        done
